@@ -1,0 +1,34 @@
+{
+  "name": "perfect-web-clone",
+  "version": "3.0.0",
+  "description": "Pixel-perfect clones of any webpage. Paste a URL, get a measured Vite + React replica.",
+  "keywords": [
+    "pixel-perfect",
+    "web-clone",
+    "playwright",
+    "dsh-plugin"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "plugin/index.js",
+  "files": [
+    "plugin",
+    "cordis.patch.yml",
+    "skill",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ericshang98/Perfect-Web-Clone.git"
+  }
+}

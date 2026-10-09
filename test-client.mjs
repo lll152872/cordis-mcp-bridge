@@ -52,17 +52,35 @@ child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initia
 const list = await request("tools/list", {});
 const names = list.tools.map((t) => t.name);
 if (!names.includes("bridge_echo")) fail(`tools/list missing bridge_echo: ${names}`);
-const echoSpec = list.tools.find((t) => t.name === "bridge_echo");
-if (echoSpec.inputSchema?.type !== "object" || !echoSpec.inputSchema.required?.includes("text"))
-  fail(`inputSchema not standard JSON Schema: ${JSON.stringify(echoSpec.inputSchema)}`);
-console.log("PASS 2: tools/list ->", names.join(", "), "| inputSchema OK");
 
-// 3) tools/call
+// 阶段3验收①：第三方插件装载激活 —— pwc_* 全部 7 个工具出现在 MCP 清单里
+const pwcTools = names.filter((n) => n.startsWith("pwc_"));
+const EXPECTED_PWC = ["pwc_extract", "pwc_plan", "pwc_assemble", "pwc_build", "pwc_fingerprints", "pwc_weight", "pwc_score"];
+for (const t of EXPECTED_PWC) {
+  if (!pwcTools.includes(t)) fail(`plugin not activated, missing ${t}; got: ${names}`);
+}
+const pwcSpec = list.tools.find((t) => t.name === "pwc_extract");
+if (pwcSpec.inputSchema?.properties?.url?.type !== "string")
+  fail(`pwc_extract inputSchema wrong: ${JSON.stringify(pwcSpec.inputSchema)}`);
+console.log(`PASS 2: tools/list -> ${names.length} tools (plugin: ${pwcTools.length}/7 pwc_*) | inputSchema OK`);
+
+// 3) tools/call —— 内置工具
 const call = await request("tools/call", { name: "bridge_echo", arguments: { text: "hello mcp" } });
 if (call.isError) fail(`tools/call isError: ${JSON.stringify(call)}`);
 if (!call.content?.[0]?.text?.includes("hello mcp")) fail(`unexpected content: ${JSON.stringify(call)}`);
 if (call.structuredContent?.echoed !== "hello mcp") fail(`unexpected structuredContent: ${JSON.stringify(call)}`);
 console.log("PASS 3: tools/call ->", call.content[0].text, "| structured:", JSON.stringify(call.structuredContent));
+
+// 3b) 阶段3验收②+③：第三方插件工具真实执行 —— pwc CLI 未安装时，插件内部错误
+//     必须以 isError + 可读消息透传到客户端（桥不吞错、不崩）
+const pwcCall = await request("tools/call", {
+  name: "pwc_fingerprints",
+  arguments: { dirpath: "." },
+});
+if (!pwcCall.isError) fail(`pwc_fingerprints should error without pwc CLI: ${JSON.stringify(pwcCall)}`);
+if (!pwcCall.content?.[0]?.text?.includes("pwc CLI not found"))
+  fail(`pwc error not the plugin's own message: ${JSON.stringify(pwcCall.content)}`);
+console.log("PASS 3b: plugin tool error passthrough ->", pwcCall.content[0].text.slice(0, 60), "…");
 
 // 4) 未知工具 → isError 而非崩溃
 const bad = await request("tools/call", { name: "no_such_tool", arguments: {} });

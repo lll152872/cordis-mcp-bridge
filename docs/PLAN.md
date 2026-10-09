@@ -192,3 +192,13 @@
 3. **import type 是生态习惯**（类型擦除、运行时零负担），对 bridge 是利好。
 
 结论修订：bridge 实际射程比官方包抽样的估计**更宽**（纯工具第三方插件零 shim 激活），但 dsh-meme 这类全功能插件要按 stub 清单逐个补，不存在"纯 tools 域"一条线划清的边界。
+### 补充 G：阶段3适配实测（2026-10-09，Perfect-Web-Clone 全绿）
+
+样本：ericshang98/Perfect-Web-Clone（纯 tools 域第三方插件，7 个 pwc_* 工具）。装载三级验收全过：
+① **装载激活**：`{name, inject, apply}` 对象形态 `ctx.plugin()` → 7/7 工具注册（`inject:['tools']` 门控通过；`ctx.get('skills')` 软依赖缺失自动跳过，符合预期）。
+② **协议暴露**：MCP tools/list 列出全部 7 个 + inputSchema 标准。
+③ **错误透传**：pwc CLI 未安装时，插件自己的安装指引消息原样以 isError 送达客户端（桥不吞错、不崩、后续调用正常）。
+
+两个适配级发现（都是桥的核心职责，已固化为 `compat/`）：
+1. **装载形态**：cordis 对函数导出会 `new` 调用（`new apply`）——插件必须以 `{name, inject, apply}` 对象形态装载，不能用命名空间对象直塞。
+2. **API 断层**：插件面向的 dsh-tools API 与 rc.2/alpha 不一致（`defineTool` 无 `output` 字段两版都 throw）。解法 = Node 官方 `module.register()` ESM resolve hook：只拦 parentURL 在 plugins/ 下的 `@deepseek-ai/dsh-tools`，重定向到 compat 包装模块（`export *` 透传 + 本地 defineTool 覆盖，缺 output 补默认 schema 与 JSON 序列化渲染）。服务链本体零改动。

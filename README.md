@@ -24,8 +24,10 @@
 |---|---|---|
 | 1 | cordis 冒烟：官方服务链（systemPrompt→tools）挂载、工具注册/调用/schema 校验 | ✅ `npm run smoke` 5 PASS |
 | 2 | MCP 出口：stdio JSON-RPC（initialize / tools/list / tools/call / ping），手写零 SDK | ✅ `npm run selftest` 5 PASS |
-| 3 | 接真实第三方插件（Perfect-Web-Clone / dsh-meme 等） | ⬜ |
+| 3 | 接真实第三方插件 | ✅ **Perfect-Web-Clone 7/7 工具激活**，含生态兼容垫片（`compat/`）|
 | 4 | 插件清单外置（`bridge.yml`） | ⬜ |
+
+**阶段 3 的关键发现**：第三方插件面向的 `dsh-tools` API 与 0.2.x 断层（如 `defineTool` 无 `output` 字段在 rc.2/alpha 都会 throw）。桥用 Node 官方 `module.register()` ESM hook（`compat/loader.mjs`）拦截**插件模块图**里的 `@deepseek-ai/dsh-tools`，包一层 `defineTool` 补默认 output——服务链本体与桥自身 import 不受影响。**兼容垫片是桥的核心职责，不是可选项。**
 
 设计讨论与生态勘察全记录见 [`docs/PLAN.md`](docs/PLAN.md)。
 

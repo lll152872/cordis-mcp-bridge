@@ -9,13 +9,22 @@
 //   4. stdin EOF（客户端退出）→ 主动退出，不留孤儿进程。
 
 import { createInterface } from "node:readline";
+import { register } from "node:module";
 import process from "node:process";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { dirname, join } from "node:path";
 import { Context } from "@deepseek-ai/cordis";
 import { SystemPrompt } from "@deepseek-ai/dsh-system-prompt";
 import { ToolRuntime, defineTool } from "@deepseek-ai/dsh-tools";
 
 const VERSION = "0.1.0";
 const err = (...a) => console.error("[bridge]", ...a);
+
+// 从任何目录被 spawn 都以仓库根为工作目录（插件相对路径、子进程 cwd 才稳定）
+process.chdir(dirname(fileURLToPath(import.meta.url)));
+
+// 生态兼容垫片：拦截插件模块图里的 @deepseek-ai/dsh-tools（必须在插件 import 之前注册）
+register("./compat/loader.mjs", import.meta.url);
 
 // ---------- cordis 服务链 ----------
 const ctx = new Context();
@@ -44,6 +53,26 @@ const echo = defineTool({
   },
 });
 ctx.tools.register(echo);
+
+// ---------- 第三方插件装载（阶段3） ----------
+// v1 清单内置于 PLUGINS；阶段4外置为 bridge.yml。
+// 插件 = 任意 cordis/dsh 插件模块（name/inject/apply 形态）。
+// inject 缺失服务 → cordis 语义静默不激活（预期，不算错）；装载异常 → 记录后继续，不打死桥。
+const PLUGINS = [
+  "./plugins/Perfect-Web-Clone/plugin/index.js",
+];
+
+for (const rel of PLUGINS) {
+  try {
+    const mod = await import(pathToFileURL(join(process.cwd(), rel)));
+    // 对象形态装载：让 cordis 调 apply(ctx, config)，而不是把 apply 函数当类 new
+    await ctx.plugin({ name: mod.name, inject: mod.inject, apply: mod.apply });
+    const injected = mod.inject ? `[inject: ${mod.inject.join(", ")}]` : "";
+    err(`plugin loaded: ${mod.name ?? rel} ${injected}`);
+  } catch (e) {
+    err(`plugin FAILED to load: ${rel} — ${e?.stack ?? e}`);
+  }
+}
 
 // ---------- 工具清单（全局层视图） ----------
 function listTools() {
