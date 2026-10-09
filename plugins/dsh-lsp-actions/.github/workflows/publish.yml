@@ -1,0 +1,88 @@
+name: Publish
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          # No registry-url on purpose: it writes
+          # //registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN} into .npmrc, and with
+          # the secret retired that line is an empty bearer token - the registry
+          # answers 404 on PUT instead of letting npm do the OIDC exchange.
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run lint
+      - run: pnpm run build
+      - run: pnpm test
+      - name: Verify package contents
+        run: npm pack --dry-run
+      # Trusted publishing: the OIDC token (id-token: write at the top) replaces the
+      # NPM_TOKEN secret, so this step reads none. The "no token -> notice and
+      # succeed" branch is gone on purpose: with the secret retired it would turn
+      # every release into a silent no-op.
+      - name: Upgrade npm and show what the publish will authenticate with
+        run: |
+          npm install -g npm@^11.5.1
+          echo "npm: $(npm --version)"
+          echo "registry: $(npm config get registry)"
+          if [ -f .npmrc ]; then echo "--- workspace .npmrc ---"; cat .npmrc; else echo "no workspace .npmrc"; fi
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then echo "OIDC request TOKEN: present"; else echo "OIDC request TOKEN: MISSING"; fi
+      - name: Publish to npm
+        env:
+          # npm's OIDC exchange never throws: a failure is only visible at verbose
+          # level, otherwise the step just fails with ENEEDAUTH and no reason.
+          NPM_CONFIG_LOGLEVEL: verbose
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if npm view "dsh-lsp-actions@${version}" version >/dev/null 2>&1; then
+            echo "dsh-lsp-actions@${version} is already published; skipping npm publish"
+          else
+            npm publish --access public --provenance
+          fi
+
+  # npm publish alone left every release without a GitHub Release page (v0.5.0
+  # had to be created by hand after the fact). This job closes that gap and is
+  # idempotent, so re-running a tag is safe.
+  release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create the GitHub Release from the CHANGELOG
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            echo "release ${{ github.ref_name }} already exists; skipping"
+            exit 0
+          fi
+          VERSION="${GITHUB_REF_NAME#v}"
+          # A CHANGELOG missing this version's section must not fail the job:
+          # npm has already published by now, and a missing Release page is
+          # exactly the gap this job exists to close. Fall back to generated
+          # notes instead of going red.
+          node scripts/changelog-section.mjs "$VERSION" > release-notes.md || true
+          if [ -s release-notes.md ]; then
+            gh release create "${{ github.ref_name }}" \
+              --title "${{ github.ref_name }}" \
+              --notes-file release-notes.md
+          else
+            gh release create "${{ github.ref_name }}" --generate-notes
+          fi

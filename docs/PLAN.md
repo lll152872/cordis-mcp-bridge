@@ -202,3 +202,27 @@
 两个适配级发现（都是桥的核心职责，已固化为 `compat/`）：
 1. **装载形态**：cordis 对函数导出会 `new` 调用（`new apply`）——插件必须以 `{name, inject, apply}` 对象形态装载，不能用命名空间对象直塞。
 2. **API 断层**：插件面向的 dsh-tools API 与 rc.2/alpha 不一致（`defineTool` 无 `output` 字段两版都 throw）。解法 = Node 官方 `module.register()` ESM resolve hook：只拦 parentURL 在 plugins/ 下的 `@deepseek-ai/dsh-tools`，重定向到 compat 包装模块（`export *` 透传 + 本地 defineTool 覆盖，缺 output 补默认 schema 与 JSON 序列化渲染）。服务链本体零改动。
+
+### 补充 H：真兼容路线打通（2026-10-09 下午，服务层 12 服务 + 三插件矩阵）
+
+**推翻"服务提供者 vendor 不到"的结论**：harness 服务层实现全量在 npm（0.2.0-rc.2，latest 标签假象第二次被识破）。`npm i --save-exact` 直接装真服务。
+
+**服务面 2 → 12**：systemPrompt / llm / sessions / sessionProjections / agents / agentDefaultModel / skills / fs / subprocess / webServer(stub) / attachments(本地存储) / tools。全部实测激活（`services.mjs`）。
+
+**三插件装载矩阵（全部激活）**：
+| 插件 | inject | 结果 |
+|---|---|---|
+| perfect-web-clone | tools | 7 工具 + 门禁数据修复（见下） |
+| lsp-actions（npm@0.5.11） | tools, fs, subprocess | **8 个 lsp_* 工具激活**——npm 真 fs/subprocess 服务喂活 |
+| dsh-expression（dsh-meme npm@0.1.47） | tools, webServer, agentDefaultModel, attachments | send_meme/learn_meme 激活；路由/管理面板全走通 |
+
+**适配过程钉死的五个规则（全部已固化）**：
+1. 服务包间 peer 链在 `--legacy-peer-deps` 下不自动装 → 用"import 报错→补装→重试"循环收敛（本次 3 轮：dsh-http-proxy 等）。
+2. `cordis effect(fn)` 返回值必须满足 disposer 合约（function/promise/generator/null）——stub 的 register 返回对象会炸出 "Invalid effect"，返回 disposer 即合规。cordis 4 的 effect 与 0.1.x 普通函数语义兼容，无需垫片。
+3. 对象形态装载时 apply 的 config 参数必须桥侧补默认 `{}` 并喂插件清单 config——dsh loader 的 schemastery 填默认行为桥要手动复刻（lsp-actions 顶层 max* 字段）。
+4. 插件 `console.log` 打 stdout 会污染 MCP 帧 → 桥启动时全局重定向 stderr。
+5. stdout 出现非 JSON 行时 test-client 崩溃——已由第 4 条根治。
+
+**exit-code 门禁数据修复（用户"vibe 改写插件代码"思路的第一个实战）**：`pwc_fingerprints` 命中门禁时 exit 1 + stdout 合法 JSON（ok:false + total/by_pattern/files），原 runPwc 直接 reject → 报告判定 🔴 数据丢失。桥适配副本改 3 行（exit≠0 但 stdout 可 parse 出带 ok 字段的 JSON → resolve），实测 `total=2, patterns=shopify,original\.css` 完整送达 structuredContent。**结论：个别插件的特异 bug，改插件副本 3 行 > 桥侧通用启发式**——改写发生在桥管理的 plugins/ 副本上（标记 [bridge-adapted]），上游修复后可回退。
+
+**对 40 分报告的最终更新**：① skills 注册已通（剩送达通道=instructions/prompts，P0）；③ 已修；⑤ 服务面 12/20（剩余绑 harness 深层语义：agent 会话流、llm 真调用）。三个实测样本全部激活且工具可达。

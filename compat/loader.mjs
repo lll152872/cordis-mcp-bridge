@@ -8,12 +8,18 @@
 
 const PLUGIN_MARK = "/plugins/";
 
+/** 这条 parentURL 是否属于第三方插件模块图（本地 plugins/ 目录或 npm 安装的插件包） */
+function isPluginModule(parentURL) {
+  const url = decodeURIComponent(parentURL ?? "");
+  if (url.includes(PLUGIN_MARK)) return true;
+  // npm 安装的插件（如 dsh-meme、dsh-lsp-actions）在 node_modules 顶层；
+  // 服务链自身的 import 都在 node_modules/@deepseek-ai/ 下，不拦。
+  if (url.includes("/node_modules/") && !url.includes("/node_modules/@deepseek-ai/")) return true;
+  return false;
+}
+
 export async function resolve(specifier, context, next) {
-  if (
-    specifier === "@deepseek-ai/dsh-tools" &&
-    context.parentURL &&
-    decodeURIComponent(context.parentURL).includes(PLUGIN_MARK)
-  ) {
+  if (specifier === "@deepseek-ai/dsh-tools" && isPluginModule(context.parentURL)) {
     return {
       url: new URL("./dsh-tools-compat.mjs", import.meta.url).href,
       shortCircuit: true,

@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [22, 24]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # The published-line ruler: it existed as a script but no workflow invoked
+      # it, so the second type face was decorative on CI (G-4b). It clears
+      # `paths`, so it needs no harness checkout and is safe on a runner.
+      - name: Typecheck (published line)
+        run: pnpm run typecheck:ci
+      - run: pnpm run lint
+      - run: pnpm run build
+      - run: pnpm run verify:self-contained
+      - run: pnpm run verify:artifacts
+      - run: pnpm run check:readmes
+      - run: pnpm test
+
+  coverage:
+    # One gate job instead of re-running v8 coverage in every matrix cell: the matrix proves
+    # portability, this job proves the coverage thresholds (lines/statements/functions >= 90%,
+    # branches >= 85%) and archives the summary.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run test:coverage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-summary
+          path: coverage/coverage-summary.json
+          if-no-files-found: error

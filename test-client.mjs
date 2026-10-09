@@ -71,16 +71,21 @@ if (!call.content?.[0]?.text?.includes("hello mcp")) fail(`unexpected content: $
 if (call.structuredContent?.echoed !== "hello mcp") fail(`unexpected structuredContent: ${JSON.stringify(call)}`);
 console.log("PASS 3: tools/call ->", call.content[0].text, "| structured:", JSON.stringify(call.structuredContent));
 
-// 3b) 阶段3验收②+③：第三方插件工具真实执行 —— pwc CLI 未安装时，插件内部错误
-//     必须以 isError + 可读消息透传到客户端（桥不吞错、不崩）
+// 3b) 阶段3验收②+③：第三方插件工具真实执行。
+//     pwc_fingerprints 对本仓库扫描会命中门禁指纹（exit 1 + ok:false JSON）——
+//     桥适配副本已把"exit≠0 但 stdout 为 JSON"转为正常结果，结构化数据必须完整送达。
 const pwcCall = await request("tools/call", {
   name: "pwc_fingerprints",
   arguments: { dirpath: "." },
 });
-if (!pwcCall.isError) fail(`pwc_fingerprints should error without pwc CLI: ${JSON.stringify(pwcCall)}`);
-if (!pwcCall.content?.[0]?.text?.includes("pwc CLI not found"))
-  fail(`pwc error not the plugin's own message: ${JSON.stringify(pwcCall.content)}`);
-console.log("PASS 3b: plugin tool error passthrough ->", pwcCall.content[0].text.slice(0, 60), "…");
+if (pwcCall.isError) fail(`pwc_fingerprints unexpected error: ${JSON.stringify(pwcCall.content)}`);
+// dsh-tools 语义：返回值 {ok:false} 会被规范成 {ok:false, error:{原始结果}}（失败但带详情）——
+// 数据没丢，只是换了位置；两种位置都验收
+const sc = pwcCall.structuredContent;
+const data = sc?.error ?? sc;
+if (!data || typeof data.total !== "number" || !data.by_pattern)
+  fail(`gate-failure structured data lost: ${JSON.stringify(sc)}`);
+console.log(`PASS 3b: gate-failure data intact -> ok:false, total=${data.total}, patterns=${Object.keys(data.by_pattern).join(",")}`);
 
 // 4) 未知工具 → isError 而非崩溃
 const bad = await request("tools/call", { name: "no_such_tool", arguments: {} });

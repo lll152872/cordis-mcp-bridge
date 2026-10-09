@@ -1,0 +1,346 @@
+/**
+ * The action runner the three tools call: official-seam-first, own-client-fallback. When the
+ * extended `ctx.lsp` seam is mounted, actions go through it; when the seam is absent, too old, or
+ * has no provider for the file, the plugin's own client serves the call from the `servers` table.
+ * A seam provider that exists but lacks the capability fails loud — the user configured the
+ * server in one place and gets a real error instead of a silently spawned duplicate.
+ * @module dsh-lsp-actions/runner
+ */
+
+import { LspActionClient } from './client.ts'
+import type { ActionRequest } from './client.ts'
+import type { FileSystem } from '@deepseek-ai/dsh-fs'
+import type { HostSource } from './host.ts'
+import { finalExtension } from './extension.ts'
+import { configuredProjectMarkers, findProjectMarker } from './project.ts'
+import { firstLanguageId, routeFile } from './servers.ts'
+import type { ResolvedServer, ServerRoute } from './servers.ts'
+import { classifySeamAttempt, trySeamAction } from './seam.ts'
+import type { SeamAttempt, SeamExtras, SeamService, SeamVintage } from './seam.ts'
+import type {
+  LspActionResult,
+  LspCodeActionsResult,
+  LspCompletionResult,
+  LspDiagnosticsResult,
+  LspEditsResult,
+  LspInlayHintsResult,
+  LspPosition,
+  LspRange,
+  LspRenameResult,
+  LspSignaturesResult,
+  LspSymbolsResult,
+} from './vocabulary.ts'
+import { LspActionError } from './vocabulary.ts'
+
+/** One action call as the tools prepare it: everything the runner needs to serve it either way. */
+export interface RunnerRequest {
+  /** The source file (relative to `workspaceRoot` or absolute). */
+  readonly filePath: string
+  /** The workspace root the server resolves against. */
+  readonly workspaceRoot: string
+  /** The pre-read source the own client's didOpen synchronizes (the seam re-reads its own copy). */
+  readonly source?: HostSource
+  /** The cursor position, for completion and signature help. */
+  readonly position?: LspPosition
+  /** The formatting/code-action/inlay-hint range, for range-scoped operations. */
+  readonly range?: LspRange
+  /** The symbol name query, for workspace symbol search. */
+  readonly query?: string
+  /** CodeActionKind filters, for code actions. */
+  readonly onlyKinds?: readonly string[]
+}
+
+/**
+ * The LSP action provider interface: the unified surface the tools consume, agnostic of which
+ * backend served the result. The bundled runner (seam-first, own-client-fallback) implements it;
+ * a third-party plugin can implement and register an alternative provider of this same contract
+ * without touching the tools.
+ */
+export interface ActionRunner {
+  diagnostics(request: RunnerRequest, signal?: AbortSignal): Promise<LspDiagnosticsResult>
+  formatDocument(request: RunnerRequest, signal?: AbortSignal): Promise<LspEditsResult>
+  completion(request: RunnerRequest, signal?: AbortSignal): Promise<LspCompletionResult>
+  codeActions(request: RunnerRequest, signal?: AbortSignal): Promise<LspCodeActionsResult>
+  workspaceSymbols(request: RunnerRequest, signal?: AbortSignal): Promise<LspSymbolsResult>
+  documentSymbols(request: RunnerRequest, signal?: AbortSignal): Promise<LspSymbolsResult>
+  signatureHelp(request: RunnerRequest, signal?: AbortSignal): Promise<LspSignaturesResult>
+  inlayHints(request: RunnerRequest, signal?: AbortSignal): Promise<LspInlayHintsResult>
+  rename(request: RunnerRequest, newName: string, signal?: AbortSignal): Promise<LspRenameResult>
+}
+
+/**
+ * Create the seam-first action runner. The seam is resolved through `getSeam` on every call, not
+ * captured at apply time, so the plugin serves through a seam that loads after it or is re-added
+ * later; a seam that is absent at call time falls back to the own client. When an `fs` seam is
+ * supplied, a file whose nearest project marker is claimed by a server entry routes to that entry
+ * before the plain extension map applies (see `findProjectMarker`).
+ * @param options - the per-call seam resolver, the own client, the resolved server table, and the
+ *   optional filesystem used for project-marker routing.
+ * @returns the runner facade.
+ */
+export function createActionRunner(options: {
+  readonly getSeam: () => SeamService | undefined
+  readonly client: LspActionClient
+  readonly servers: readonly ResolvedServer[]
+  /** Filesystem used to detect each file's project marker; omit to route by globs/extensions only. */
+  readonly fs?: FileSystem
+}): ActionRunner {
+  const markers = options.fs === undefined ? [] : configuredProjectMarkers(options.servers)
+  const fs = options.fs
+  // Seam vintages are cached per seam INSTANCE, not per runner: the contract allows a seam to load
+  // after this plugin or be re-added mid-session, and a fresh seam object deserves a fresh record.
+  const vintages = new WeakMap<SeamService, Exclude<SeamVintage, 'absent'>>()
+  const seamVintageOf = (seam: SeamService): Exclude<SeamVintage, 'absent'> | undefined => vintages.get(seam)
+  const recordSeamVintage = (seam: SeamService, attempt: SeamAttempt): void => {
+    vintages.set(seam, classifySeamAttempt(attempt))
+  }
+  const collaborators: Omit<RunnerOptions, 'seam'> = {
+    client: options.client,
+    servers: options.servers,
+    seamVintageOf,
+    recordSeamVintage,
+    projectMarker: fs === undefined || markers.length === 0
+      ? noProjectMarker
+      : (filePath, workspaceRoot, signal) => findProjectMarker(fs, markers, filePath, workspaceRoot, signal),
+  }
+  return {
+    diagnostics: (request, signal) => runOp({ ...collaborators, seam: options.getSeam() }, 'diagnostics', request, signal),
+    formatDocument: (request, signal) => runOp({ ...collaborators, seam: options.getSeam() }, 'formatDocument', request, signal),
+    completion: (request, signal) => runOp({ ...collaborators, seam: options.getSeam() }, 'completion', request, signal),
+    codeActions: (request, signal) => runOp({ ...collaborators, seam: options.getSeam() }, 'codeAction', request, signal),
+    workspaceSymbols: (request, signal) => runOp({ ...collaborators, seam: options.getSeam() }, 'workspaceSymbol', request, signal),
+    documentSymbols: (request, signal) => runOp({ ...collaborators, seam: options.getSeam() }, 'documentSymbol', request, signal),
+    signatureHelp: (request, signal) => runOp({ ...collaborators, seam: options.getSeam() }, 'signatureHelp', request, signal),
+    inlayHints: (request, signal) => runOp({ ...collaborators, seam: options.getSeam() }, 'inlayHint', request, signal),
+    rename: (request, newName, signal) => renameOp({ ...collaborators, seam: options.getSeam() }, request, newName, signal),
+  }
+}
+
+/** The per-call collaborators every operation runs with: the resolved seam plus the runner's own deps. */
+interface RunnerOptions {
+  /** The seam resolved for this call (`undefined` when absent or not serving actions). */
+  readonly seam: SeamService | undefined
+  /**
+   * The vintage already recorded for one seam instance, or undefined when it has not been probed
+   * yet. A `legacy` answer means the seam can never serve an action, so the call skips the
+   * guaranteed-failing query and goes straight to the plugin's own client. Omitted by direct
+   * `runOp` callers (no caching, every call attempts the seam).
+   */
+  readonly seamVintageOf?: (seam: SeamService) => Exclude<SeamVintage, 'absent'> | undefined
+  /** Record the vintage one real attempt proved, so later calls can skip a legacy seam. */
+  readonly recordSeamVintage?: (seam: SeamService, attempt: SeamAttempt) => void
+  readonly client: LspActionClient
+  readonly servers: readonly ResolvedServer[]
+  /** The target file's governing project marker, or undefined when the table declares none. */
+  readonly projectMarker: (filePath: string, workspaceRoot: string, signal?: AbortSignal) => Promise<string | undefined>
+}
+
+/** The project resolver used when no server entry declares a marker (no filesystem access at all). */
+async function noProjectMarker(): Promise<string | undefined> {
+  return undefined
+}
+
+/** The route for one request: the nearest claimed project marker decides, then globs/extensions. */
+async function routeForFile(options: RunnerOptions, request: RunnerRequest, signal?: AbortSignal): Promise<ServerRoute | undefined> {
+  const projectMarker = await options.projectMarker(request.filePath, request.workspaceRoot, signal)
+  return routeFile(options.servers, request.filePath, projectMarker)
+}
+
+/** Serve one action: seam first, then the own client, failing loud where fallback is wrong. */
+async function runOp(
+  options: RunnerOptions,
+  operation: 'diagnostics',
+  request: RunnerRequest,
+  signal?: AbortSignal,
+): Promise<LspDiagnosticsResult>
+async function runOp(
+  options: RunnerOptions,
+  operation: 'formatDocument',
+  request: RunnerRequest,
+  signal?: AbortSignal,
+): Promise<LspEditsResult>
+async function runOp(
+  options: RunnerOptions,
+  operation: 'completion',
+  request: RunnerRequest,
+  signal?: AbortSignal,
+): Promise<LspCompletionResult>
+async function runOp(
+  options: RunnerOptions,
+  operation: 'codeAction',
+  request: RunnerRequest,
+  signal?: AbortSignal,
+): Promise<LspCodeActionsResult>
+async function runOp(
+  options: RunnerOptions,
+  operation: 'workspaceSymbol' | 'documentSymbol',
+  request: RunnerRequest,
+  signal?: AbortSignal,
+): Promise<LspSymbolsResult>
+async function runOp(
+  options: RunnerOptions,
+  operation: 'signatureHelp',
+  request: RunnerRequest,
+  signal?: AbortSignal,
+): Promise<LspSignaturesResult>
+async function runOp(
+  options: RunnerOptions,
+  operation: 'inlayHint',
+  request: RunnerRequest,
+  signal?: AbortSignal,
+): Promise<LspInlayHintsResult>
+async function runOp(
+  options: RunnerOptions,
+  operation: 'diagnostics' | 'formatDocument' | 'completion' | 'codeAction' | 'workspaceSymbol' | 'documentSymbol' | 'signatureHelp' | 'inlayHint',
+  request: RunnerRequest,
+  signal?: AbortSignal,
+): Promise<LspActionResult> {
+  if (options.seam !== undefined) {
+    // A `legacy` seam (the published four-operation surface) rejects every action operation with a
+    // code-less error; that is a capability fact about the seam, so it is recorded from the first
+    // real attempt and cached per seam instance, after which a legacy seam is skipped entirely
+    // instead of paying a failed round trip on every call. No extra probe query is spent.
+    if (options.seamVintageOf?.(options.seam) !== 'legacy') {
+      const attempt = await trySeamAction(
+        options.seam,
+        operation,
+        request.filePath,
+        request.workspaceRoot,
+        request.position,
+        request.range,
+        signal,
+        extrasFor(operation, request),
+      )
+      options.recordSeamVintage?.(options.seam, attempt)
+      if (attempt.ok) return attempt.result
+      if (attempt.reason === 'unsupported') {
+        throw new LspActionError(
+          `the mounted ctx.lsp provider does not support ${operation}; configure a server that advertises it`,
+          'LSP_ACTION_UNSUPPORTED',
+        )
+      }
+      if (attempt.reason === 'error') throw attempt.error
+      // absent / legacy / unavailable: the seam cannot serve this action — fall through to the
+      // plugin's own client, which fails loud itself when no server entry handles the file.
+    }
+  }
+  // Workspace symbol search has no document to route by: when no entry matches (or no file path
+  // was supplied), fall back to the first configured server.
+  const routed = await routeForFile(options, request, signal)
+  const route = routed ?? firstServerRoute(options.servers, operation)
+  if (route === undefined) {
+    throw new LspActionError(noRouteMessage(request.filePath), 'LSP_ACTION_UNAVAILABLE')
+  }
+  if (operation === 'workspaceSymbol') {
+    // With a routing file, keep it open for the request: project-based servers (tsls) refuse
+    // document-free workspace/symbol.
+    if (request.source !== undefined) {
+      const actionRequest: ActionRequest = {
+        filePath: request.filePath,
+        workspaceRoot: request.workspaceRoot,
+        source: request.source,
+        languageId: route.languageId,
+      }
+      return await options.client.workspaceSymbolsInDocument(route.server, actionRequest, request.query ?? '', signal)
+    }
+    return await options.client.workspaceSymbols(route.server, request.workspaceRoot, request.query ?? '', signal)
+  }
+  if (request.source === undefined) {
+    throw new LspActionError(`the ${operation} action requires a source document`, 'LSP_ACTION_WORKSPACE_REQUIRED')
+  }
+  const actionRequest: ActionRequest = {
+    filePath: request.filePath,
+    workspaceRoot: request.workspaceRoot,
+    source: request.source,
+    languageId: route.languageId,
+    ...request.position === undefined ? {} : { position: request.position },
+    ...request.range === undefined ? {} : { range: request.range },
+    ...request.onlyKinds === undefined ? {} : { onlyKinds: request.onlyKinds },
+  }
+  switch (operation) {
+    case 'diagnostics': return await options.client.diagnostics(route.server, actionRequest, signal)
+    case 'formatDocument': return await options.client.formatDocument(route.server, actionRequest, signal)
+    case 'completion': return await options.client.completion(route.server, actionRequest, signal)
+    case 'codeAction': return await options.client.codeActions(route.server, actionRequest, signal)
+    case 'documentSymbol': return await options.client.documentSymbols(route.server, actionRequest, signal)
+    case 'signatureHelp': return await options.client.signatureHelp(route.server, actionRequest, signal)
+    case 'inlayHint': return await options.client.inlayHints(route.server, actionRequest, signal)
+  }
+}
+
+/** The first configured server's route, for workspace-scoped actions without a file to route by. */
+function firstServerRoute(servers: readonly ResolvedServer[], operation: string): { server: ResolvedServer; languageId: string } | undefined {
+  if (operation !== 'workspaceSymbol') return undefined
+  const first = servers[0]
+  if (first === undefined) return undefined
+  return { server: first, languageId: firstLanguageId(first) }
+}
+
+/** The operation-specific extras one seam query carries (`query` for symbol search, `only` filters). */
+function extrasFor(operation: string, request: RunnerRequest): SeamExtras {
+  switch (operation) {
+    case 'workspaceSymbol': return request.query === undefined ? {} : { query: request.query }
+    case 'codeAction': return request.onlyKinds === undefined ? {} : { onlyKinds: request.onlyKinds }
+    default: return {}
+  }
+}
+
+/**
+ * Serve the rename action: seam first (only a seam that answers with the `rename` result kind
+ * serves it — any current seam vintage falls back), then the plugin's own client.
+ */
+async function renameOp(
+  options: RunnerOptions,
+  request: RunnerRequest,
+  newName: string,
+  signal?: AbortSignal,
+): Promise<LspRenameResult> {
+  if (options.seam !== undefined) {
+    const attempt = await trySeamAction(
+      options.seam,
+      'rename',
+      request.filePath,
+      request.workspaceRoot,
+      request.position,
+      request.range,
+      signal,
+      { newName },
+    )
+    if (attempt.ok) {
+      if (attempt.result.kind === 'rename') return attempt.result
+      // A seam answered with a different result kind: it cannot serve rename — fall through.
+    } else {
+      if (attempt.reason === 'unsupported') {
+        throw new LspActionError(
+          'the mounted ctx.lsp provider does not support rename; configure a server that advertises it',
+          'LSP_ACTION_UNSUPPORTED',
+        )
+      }
+      if (attempt.reason === 'error') throw attempt.error
+      // absent / legacy / unavailable: the seam cannot serve rename — fall through to the
+      // plugin's own client, which fails loud itself when no entry handles the file.
+    }
+  }
+  const route = await routeForFile(options, request, signal)
+  if (route === undefined) {
+    throw new LspActionError(noRouteMessage(request.filePath), 'LSP_ACTION_UNAVAILABLE')
+  }
+  if (request.source === undefined) {
+    throw new LspActionError('the rename action requires a source document', 'LSP_ACTION_WORKSPACE_REQUIRED')
+  }
+  const actionRequest: ActionRequest = {
+    filePath: request.filePath,
+    workspaceRoot: request.workspaceRoot,
+    source: request.source,
+    languageId: route.languageId,
+    ...request.position === undefined ? {} : { position: request.position },
+  }
+  return await options.client.rename(route.server, actionRequest, newName, signal)
+}
+
+/** The fail-loud message when neither the seam nor the servers table handles the file. */
+function noRouteMessage(filePath: string): string {
+  const extension = finalExtension(filePath)
+  const subject = extension === '' ? 'this file type' : `files with the "${extension}" extension`
+  return `no LSP server is configured for ${subject} — add an entry to the lsp-actions servers table, or register an LSP provider on ctx.lsp`
+}

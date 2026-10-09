@@ -15,7 +15,9 @@ function runPwc(args) {
   return new Promise((resolve, reject) => {
     const child = spawn('pwc', args, {
       cwd: REPO_DIR,
-      env: process.env,
+      // [bridge-adapted] 2026-10-09: editable 安装下 pwc CLI import mcp_server 失败，
+      // 补 REPO_DIR 进 PYTHONPATH（上游可修：pyproject 打包 mcp_server 后可删）
+      env: { ...process.env, PYTHONPATH: REPO_DIR },
     })
     let stdout = ''
     let stderr = ''
@@ -37,6 +39,16 @@ function runPwc(args) {
     child.on('close', (code) => {
       const text = (stdout || stderr || '').trim()
       if (code !== 0) {
+        // [bridge-adapted] 2026-10-09: pwc 用非零 exit code 表达"门禁失败"，
+        // 但 stdout 仍是合法 JSON 结果（ok:false + 细粒度数据）。原实现直接 reject，
+        // agent 拿不到 by_pattern/files。桥适配副本改为：能 parse 出 JSON 对象即视为有效结果。
+        try {
+          const parsed = JSON.parse(stdout)
+          if (parsed && typeof parsed === 'object' && 'ok' in parsed) {
+            resolve(parsed)
+            return
+          }
+        } catch { /* fall through to reject */ }
         reject(new Error(text || `pwc ${args.join(' ')} exited ${code}`))
         return
       }

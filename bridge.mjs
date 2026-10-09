@@ -14,8 +14,8 @@ import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { Context } from "@deepseek-ai/cordis";
-import { SystemPrompt } from "@deepseek-ai/dsh-system-prompt";
-import { ToolRuntime, defineTool } from "@deepseek-ai/dsh-tools";
+import { defineTool } from "@deepseek-ai/dsh-tools";
+import { installServices } from "./services.mjs";
 
 const VERSION = "0.1.0";
 const err = (...a) => console.error("[bridge]", ...a);
@@ -23,13 +23,16 @@ const err = (...a) => console.error("[bridge]", ...a);
 // 从任何目录被 spawn 都以仓库根为工作目录（插件相对路径、子进程 cwd 才稳定）
 process.chdir(dirname(fileURLToPath(import.meta.url)));
 
+// 铁律1的强制执行：插件常用 console.log 打日志，会打崩 MCP stdio 帧 —— 全部重定向 stderr
+console.log = (...a) => console.error("[plugin:log]", ...a);
+console.info = (...a) => console.error("[plugin:log]", ...a);
+
 // 生态兼容垫片：拦截插件模块图里的 @deepseek-ai/dsh-tools（必须在插件 import 之前注册）
 register("./compat/loader.mjs", import.meta.url);
 
-// ---------- cordis 服务链 ----------
+// ---------- cordis 服务链（真兼容：harness 服务层 npm 实现，见 services.mjs） ----------
 const ctx = new Context();
-await ctx.plugin(SystemPrompt);
-await ctx.plugin(ToolRuntime);
+await installServices(ctx);
 
 // ---------- 内置演示工具（阶段1冒烟的同一形状；阶段3起由插件清单提供真工具） ----------
 const echo = defineTool({
@@ -55,18 +58,47 @@ const echo = defineTool({
 ctx.tools.register(echo);
 
 // ---------- 第三方插件装载（阶段3） ----------
-// v1 清单内置于 PLUGINS；阶段4外置为 bridge.yml。
+// 清单条目两种形态："./plugins/…" 本地路径，或 npm 包名（需已安装到本仓库依赖）。
 // 插件 = 任意 cordis/dsh 插件模块（name/inject/apply 形态）。
 // inject 缺失服务 → cordis 语义静默不激活（预期，不算错）；装载异常 → 记录后继续，不打死桥。
 const PLUGINS = [
-  "./plugins/Perfect-Web-Clone/plugin/index.js",
+  { src: "./plugins/Perfect-Web-Clone/plugin/index.js" },
+  // 真兼容验证样本：inject ['tools','fs','subprocess'] —— fs/subprocess 为 npm 真服务。
+  // 顶层 defaults 全量抄自其 Config schema（dsh loader 会跑 schemastery 填默认，桥手动喂同值）
+  {
+    src: "dsh-lsp-actions",
+    config: {
+      servers: {},
+      maxDiagnostics: 200,
+      maxCompletionItems: 20,
+      maxCodeActions: 50,
+      maxSymbols: 100,
+      maxSignatures: 10,
+      maxInlayHints: 200,
+      maxResultChars: 16000,
+      maxDocumentBytes: 1048576,
+      timeoutMs: 60000,
+      editor: { enabled: false, requestTimeoutMs: 60000, diagnosticsCacheMaxFiles: 64 },
+    },
+  },
+  // 用户实际使用的表情包插件：inject ['tools','webServer','agentDefaultModel','attachments']
+  { src: "dsh-meme" },
 ];
 
-for (const rel of PLUGINS) {
+// 注：cordis 4 的 ctx.effect(fn) 本来就会立即调用 fn 并把返回值当 disposer 收集
+// （function→collect / promise→then / generator→迭代 / null→空），与 0.1.x 语义兼容，
+// 无需垫片。此前 dsh-meme 的 "Invalid effect" 是 stub 的 register 返回了对象而非 disposer。
+
+for (const { src: rel, config: pluginConfig } of PLUGINS) {
   try {
-    const mod = await import(pathToFileURL(join(process.cwd(), rel)));
-    // 对象形态装载：让 cordis 调 apply(ctx, config)，而不是把 apply 函数当类 new
-    await ctx.plugin({ name: mod.name, inject: mod.inject, apply: mod.apply });
+    const specifier = rel.startsWith("./") ? pathToFileURL(join(process.cwd(), rel)).href : rel;
+    const mod = await import(specifier);
+    // 对象形态装载（cordis 对函数导出会 new）+ config 缺省 {}（dsh loader 语义）
+    await ctx.plugin({
+      name: mod.name,
+      inject: mod.inject,
+      apply: (ctx2, config) => mod.apply(ctx2, config ?? pluginConfig ?? {}),
+    });
     const injected = mod.inject ? `[inject: ${mod.inject.join(", ")}]` : "";
     err(`plugin loaded: ${mod.name ?? rel} ${injected}`);
   } catch (e) {
