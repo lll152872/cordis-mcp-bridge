@@ -106,6 +106,71 @@ for (const { src: rel, config: pluginConfig } of PLUGINS) {
   }
 }
 
+// ---------- skills 送达（最后一跳） ----------
+// 插件经 skills.register() 存进注册表的剧本（如 pwc 的 257 行 harness 剧本），
+// 通过 MCP 协议内三条通道送达客户端 agent：
+//   ① initialize 的 instructions 字段（摘要 + 指引）
+//   ② bridge_skills_read 工具（全文，任何 MCP 客户端可用）
+//   ③ prompts 能力（prompts/list + prompts/get，支持它的客户端可枚举）
+// 注意：SkillRegistry.snapshot() 是 async 且默认不含 content；全文走 get(name)。
+async function runtimeSkills() {
+  const snap = await ctx.skills.snapshot();
+  return snap.skills ?? [];
+}
+
+async function skillsInstructions() {
+  const skills = await runtimeSkills();
+  if (skills.length === 0) return undefined;
+  const lines = skills.map(
+    (s) => `- ${s.name}${s.description ? `：${s.description}` : ""}（用 bridge_skills_read 工具读全文）`,
+  );
+  return [
+    "本服务器携带了来自插件的技能说明（skills）。使用插件提供的工具前，先读对应技能全文：",
+    ...lines,
+  ].join("\n");
+}
+
+// 两个内置 skills 工具（走 dsh-tools 正常注册 → 自动进 tools/list，带 MCP 前缀）
+ctx.tools.register(
+  defineTool({
+    name: "bridge_skills_list",
+    description: "列出本桥已装载插件的全部技能说明（skill）。调用插件工具前建议先读对应技能。",
+    parameters: {},
+    async execute() {
+      return { skills: runtimeSkills().map(({ name, description, provider }) => ({ name, description, provider })) };
+    },
+    output: {
+      schema: { type: "object", additionalProperties: true },
+      render(args, value) {
+        const list = value.skills.map((s) => `- ${s.name}：${s.description ?? ""}`).join("\n");
+        return `skills (${value.skills.length}):\n${list}`;
+      },
+    },
+  }),
+);
+
+ctx.tools.register(
+  defineTool({
+    name: "bridge_skills_read",
+    description: "读取某个技能的完整说明全文（markdown）。",
+    parameters: {
+      name: { type: "string", required: true, description: "技能名（见 bridge_skills_list）" },
+    },
+    async execute(args) {
+      const skill = await ctx.skills.get(args.name);
+      if (!skill?.content) return { ok: false, error: `skill not found: ${args.name}` };
+      return { ok: true, name: skill.name, content: skill.content };
+    },
+    output: {
+      schema: { type: "object", additionalProperties: true },
+      render(args, value) {
+        if (!value.ok) return `skill not found: ${args.name}`;
+        return value.content;
+      },
+    },
+  }),
+);
+
 // ---------- 工具清单（全局层视图） ----------
 function listTools() {
   const view = ctx.tools.view(undefined);
@@ -121,15 +186,19 @@ const execStub = () => ({ signal: new AbortController().signal });
 
 // ---------- MCP 方法实现 ----------
 const methods = {
-  initialize(params) {
-    // 回显客户端协议版本：客户端断言我们支持它说的版本
-    return {
+  async initialize(params) {
+    // 回显客户端协议版本：客户端断言我们支持它说的版本。
+    // instructions = skills 剧本摘要（支持它的客户端会拼进系统提示，如 orbcat）
+    const result = {
       protocolVersion: params?.protocolVersion ?? "2024-11-05",
-      capabilities: { tools: { listChanged: false } },
+      capabilities: { tools: { listChanged: false }, prompts: { listChanged: false } },
       serverInfo: { name: "cordis-mcp-bridge", version: VERSION },
     };
+    const instructions = await skillsInstructions();
+    if (instructions) result.instructions = instructions;
+    return result;
   },
-  "tools/list"() {
+  async "tools/list"() {
     return { tools: listTools() };
   },
   async "tools/call"(params) {
@@ -155,6 +224,24 @@ const methods = {
         isError: true,
       };
     }
+  },
+  async "prompts/list"() {
+    return {
+      prompts: (await runtimeSkills()).map((s) => ({
+        name: `skill_${s.name}`,
+        description: s.description ?? `Skill: ${s.name}`,
+      })),
+    };
+  },
+  async "prompts/get"(params) {
+    const wanted = String(params?.name ?? "").replace(/^skill_/, "");
+    const skill = await ctx.skills.get(wanted);
+    if (!skill?.content) throw new Error(`prompt not found: ${params?.name}`);
+    return {
+      messages: [
+        { role: "user", content: { type: "text", text: skill.content } },
+      ],
+    };
   },
   ping() {
     return {};

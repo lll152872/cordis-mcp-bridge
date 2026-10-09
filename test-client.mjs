@@ -37,14 +37,16 @@ rl.on("line", (line) => {
 
 const fail = (m) => { console.error("FAIL:", m); child.kill(); process.exit(1); };
 
-// 1) initialize
+// 1) initialize —— 含 skills 摘要 instructions（剧本送达通道①）
 const init = await request("initialize", {
   protocolVersion: "2024-11-05",
   capabilities: {},
   clientInfo: { name: "bridge-selftest", version: "0.0.0" },
 });
 if (init?.serverInfo?.name !== "cordis-mcp-bridge") fail(`initialize: ${JSON.stringify(init)}`);
-console.log("PASS 1: initialize ->", init.serverInfo.name, init.serverInfo.version, "proto", init.protocolVersion);
+if (typeof init.instructions !== "string" || !init.instructions.includes("perfect-web-clone"))
+  fail(`instructions missing skill summary: ${JSON.stringify(init.instructions)}`);
+console.log("PASS 1: initialize -> serverInfo + instructions（含 skill 摘要）✓");
 
 child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
 
@@ -91,6 +93,22 @@ console.log(`PASS 3b: gate-failure data intact -> ok:false, total=${data.total},
 const bad = await request("tools/call", { name: "no_such_tool", arguments: {} });
 if (!bad.isError) fail("unknown tool did not return isError");
 console.log("PASS 4: unknown tool -> isError:", bad.content[0].text);
+
+// 4b) skills 送达通道②③：bridge_skills_read 全文 + prompts 能力
+const skillRead = await request("tools/call", {
+  name: "bridge_skills_read",
+  arguments: { name: "perfect-web-clone" },
+});
+if (skillRead.isError) fail(`bridge_skills_read isError: ${JSON.stringify(skillRead.content)}`);
+if (!skillRead.structuredContent?.content?.includes("pwc") && !skillRead.content?.[0]?.text?.includes("pwc"))
+  fail(`skill content missing: ${JSON.stringify(skillRead).slice(0, 200)}`);
+console.log(`PASS 4b: skills read -> ${String(skillRead.structuredContent?.content ?? "").length} chars`);
+const pl = await request("prompts/list", {});
+if (!pl.prompts?.some((p) => p.name === "skill_perfect-web-clone"))
+  fail(`prompts/list missing skill prompt: ${JSON.stringify(pl)}`);
+const pg = await request("prompts/get", { name: "skill_perfect-web-clone" });
+if (!pg.messages?.[0]?.content?.text?.includes("pwc")) fail(`prompts/get broken: ${JSON.stringify(pg).slice(0, 200)}`);
+console.log("PASS 4c: prompts capability -> list+get OK");
 
 // 5) 服务端崩不了主循环：再来一次正常调用
 const again = await request("tools/call", { name: "bridge_echo", arguments: { text: "still alive" } });

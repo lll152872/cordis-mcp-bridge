@@ -226,3 +226,14 @@
 **exit-code 门禁数据修复（用户"vibe 改写插件代码"思路的第一个实战）**：`pwc_fingerprints` 命中门禁时 exit 1 + stdout 合法 JSON（ok:false + total/by_pattern/files），原 runPwc 直接 reject → 报告判定 🔴 数据丢失。桥适配副本改 3 行（exit≠0 但 stdout 可 parse 出带 ok 字段的 JSON → resolve），实测 `total=2, patterns=shopify,original\.css` 完整送达 structuredContent。**结论：个别插件的特异 bug，改插件副本 3 行 > 桥侧通用启发式**——改写发生在桥管理的 plugins/ 副本上（标记 [bridge-adapted]），上游修复后可回退。
 
 **对 40 分报告的最终更新**：① skills 注册已通（剩送达通道=instructions/prompts，P0）；③ 已修；⑤ 服务面 12/20（剩余绑 harness 深层语义：agent 会话流、llm 真调用）。三个实测样本全部激活且工具可达。
+
+### 补充 I：skills 送达三通道全通（2026-10-09 傍晚，"最后一跳"桥侧完成）
+
+注册环节早已通（skills 服务真激活），本轮补齐**送达 agent** 的三条协议内通道：
+1. **initialize `instructions`**：握手响应带 skills 摘要（名字+描述+"用 bridge_skills_read 读全文"），支持它的客户端拼进系统提示。注意 SkillRegistry.snapshot() 是 async 且默认不含 content，全文走 `await ctx.skills.get(name)`。
+2. **bridge_skills_list / bridge_skills_read 工具**：走 dsh-tools 正常注册，任何 MCP 客户端零门槛可用（实测读出 pwc 的 10756 字符剧本全文）。
+3. **prompts 能力**：prompts/list（每 skill 一条）+ prompts/get（返回全文 messages）。协议完备性，客户端不用也无碍。
+
+selftest 扩至 9 PASS（20 工具在清单）。
+
+**orbcat 侧剩余一环**（下一轮）：mcp.rs 的 `initialize()` 现在只取 serverInfo/name，丢弃 `instructions`（mcp.rs:707）。接入方案走 capability_index 同款缓存文件模式：StdioSession 加字段 → 快照拉取时写入 `<data_dir>/mcp_instructions.txt` → agent.rs 组装 system prompt 的 MCP 段落时读入拼接（mcp.rs ~40 行 + agent.rs ~10 行 + 单测，cargo build dev 37s）。
