@@ -18,6 +18,16 @@
      cordis / dsh 插件生态（defineTool + ctx.tools.register）
 ```
 
+## 与 orbcat 的关系
+
+**[orbcat](https://github.com/lll152872/orbcat)** 是一个 Windows 桌面悬浮 AI agent（Tauri + Rust，源码构建），本仓库是它的配套子项目，但**不依赖 orbcat 源码、不与它同仓**：
+
+- **动机**：orbcat 内置了 MCP 客户端（stdio），但没有 dsh/cordis 运行时。要给它扩展工具能力，与其在 Rust 里重写每个插件，不如把整个 dsh 插件生态一次性桥接成标准 MCP server——orbcat 加一条 stdio 配置就全量接入（见下方「客户端接入」的 orbcat 配置示例）。
+- **协议即边界**：桥是独立 Node 进程，两边只通过标准 MCP（JSON-RPC over stdio）通信。orbcat 怎么改、桥怎么升级，互不牵连；任何其他 MCP 客户端（Claude Code / Cherry Studio / …）用同一座桥。
+- **诞生地**：本仓库在 orbcat 的开发工作区内孵化（`D:/workplace/悬浮小agent/cordis-mcp-bridge`），设计讨论与生态勘察由 orbcat 的 agent 迭代完成，记录在 [`docs/PLAN.md`](docs/PLAN.md)。
+
+一句话：**orbcat 是第一个用户，不是唯一用户；桥只认 MCP 协议，不认宿主。**
+
 ## 状态
 
 | 阶段 | 内容 | 状态 |
